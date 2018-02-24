@@ -1,0 +1,48 @@
+<h3 style="margin: 0 10px">{{ .Name }}</h3>
+<div style="display: flex" class="pipeline">
+  {{ range .Pipelines }}
+  <div class="pipeline-action">
+    <div>
+      <strong style="white-space: nowrap">{{ .Name }}</strong>
+    </div>
+
+    {{ range .Actions }}
+    <div>
+      <a class="btn btn-sm btn-block
+
+        {{- if eq "Succeeded" .Status }}
+        btn-outline-success
+        {{- else if eq "Failed" .Status }}
+        btn-danger
+        {{- else if eq "InProgress" .Status }}
+        btn-primary
+        {{- else}}
+        btn-outline-secondary
+        {{- end}}
+
+        " href="{{if .URL}}{{.URL}}{{end}}" data-toggle="tooltip" title="{{.Status}}" data-content="
+        {{- .Author }}
+        {{- .Summary }}
+        ">
+
+        {{ if .Time }}
+          {{Time .Time}}
+        {{ else }}
+          {{ .Name }}
+        {{ end }}
+
+        {{ if eq "Succeeded" .Status }}
+          <i class="fa fa-check"></i>
+        {{ else if eq "Failed" .Status }}
+          <i class="fa fa-times"></i>
+        {{ else if eq "InProgress" .Status }}
+          <i class="fa fa-refresh fa-spin"></i>
+        {{ end }}
+
+      </a>
+    </div>
+    {{ end }}
+
+  </div>
+  {{ end }}
+</div>
