@@ -8,12 +8,18 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/cloudformation"
+	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go/service/codebuild"
 	"github.com/aws/aws-sdk-go/service/codepipeline"
 )
 
@@ -38,7 +44,6 @@ func serve(
 				http.Error(w, err.Error(), 500)
 				return
 			}
-			// err := pipe.renderPipelines(w)
 			err = table.Execute(w, pipelines)
 			if err != nil {
 				http.Error(w, err.Error(), 500)
@@ -55,6 +60,23 @@ func serve(
 		return
 	})
 
+	http.HandleFunc("/details/", func(w http.ResponseWriter, r *http.Request) {
+		accountIdx, err := strToInt(r.URL.Query().Get("account"))
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		provider := r.URL.Query().Get("provider")
+		actionID := r.URL.Query().Get("id")
+		res, err := stages[accountIdx].getActionDetails(provider, actionID)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		_, err = w.Write([]byte(res))
+		w.WriteHeader(http.StatusOK)
+	})
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -65,7 +87,13 @@ func serve(
 	fmt.Print(http.ListenAndServe(":"+port, nil))
 }
 
+func strToInt(str string) (int, error) {
+	nonFractionalPart := strings.Split(str, ".")
+	return strconv.Atoi(nonFractionalPart[0])
+}
+
 type stageConfiguration struct {
+	Index  int
 	Region string
 	Role   string
 	Name   string
@@ -73,27 +101,106 @@ type stageConfiguration struct {
 
 // PipeStage lists codepipelines in a specific region using a provided role
 type PipeStage struct {
-	pipelinesClient *codepipeline.CodePipeline
-	Name            string
+	pipelinesClient      *codepipeline.CodePipeline
+	cloudformationClient *cloudformation.CloudFormation
+	codebuildClient      *codebuild.CodeBuild
+	cloudwatchClient     *cloudwatchlogs.CloudWatchLogs
+	Name                 string
+	ID                   int
 }
 
-func (stage *PipeStage) setupClient(configuration stageConfiguration) {
+func (stage *PipeStage) setupClient(id int, configuration stageConfiguration) {
+	stage.ID = id
 	sess := session.Must(session.NewSession())
 	creds := stscreds.NewCredentials(sess, configuration.Role)
 	config := aws.NewConfig().WithCredentials(creds).WithRegion(configuration.Region)
 	stage.Name = configuration.Name
 
 	stage.pipelinesClient = codepipeline.New(sess, config)
+	stage.cloudformationClient = cloudformation.New(sess, config)
+	stage.codebuildClient = codebuild.New(sess, config)
+	stage.cloudwatchClient = cloudwatchlogs.New(sess, config)
 }
 
-func (stage *PipeStage) getPipelines() ([]*codepipeline.GetPipelineStateOutput, error) {
+type pipelineExtendedInfo struct {
+	state *codepipeline.GetPipelineStateOutput
+	info  *codepipeline.GetPipelineOutput
+}
+
+func (stage *PipeStage) getActionDetails(provider string, actionID string) (string, error) {
+	if provider == "CloudFormation" && strings.Contains(actionID, "changeset") {
+		changeSetName := strings.Split(actionID, "=")[1]
+		details, err := stage.cloudformationClient.DescribeChangeSet(
+			&cloudformation.DescribeChangeSetInput{
+				ChangeSetName: &changeSetName,
+			},
+		)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%v", details), nil
+	}
+	if provider == "CloudFormation" && strings.Contains(actionID, "stack") {
+		stackName := strings.Split(actionID, "=")[1]
+		details, err := stage.cloudformationClient.DescribeStackEvents(
+			&cloudformation.DescribeStackEventsInput{
+				StackName: &stackName,
+			},
+		)
+		if err != nil {
+			return "", err
+		}
+		// return fmt.Sprintf("%v", details), nil
+		s := ""
+		for _, event := range details.StackEvents {
+			s = s + "\n" + fmt.Sprintf(
+				"%s\t%s\t%s\t%s",
+				derefString(event.ResourceStatus),
+				derefString(event.ResourceType),
+				derefString(event.LogicalResourceId),
+				derefString(event.ResourceStatusReason),
+			)
+		}
+		return s, nil
+	}
+
+	if provider == "CodeBuild" {
+		details, err := stage.codebuildClient.BatchGetBuilds(
+			&codebuild.BatchGetBuildsInput{
+				Ids: []*string{
+					aws.String(actionID),
+				},
+			},
+		)
+		if err != nil {
+			return "", nil
+		}
+		output, err := stage.cloudwatchClient.GetLogEvents(
+			&cloudwatchlogs.GetLogEventsInput{
+				LogGroupName:  details.Builds[0].Logs.GroupName,
+				LogStreamName: details.Builds[0].Logs.StreamName,
+			},
+		)
+		if err != nil {
+			return "", nil
+		}
+		s := ""
+		for _, event := range output.Events {
+			s = s + "\n" + derefString(event.Message)
+		}
+		return s, nil
+	}
+	return "No details found for action", nil
+}
+
+func (stage *PipeStage) getPipelines() ([]*pipelineExtendedInfo, error) {
 	client := stage.pipelinesClient
 	pipelinesOutput, err := client.ListPipelines(&codepipeline.ListPipelinesInput{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pipelines for %s, %v", stage.Name, err)
 	}
 
-	pipelinesList := make([]*codepipeline.GetPipelineStateOutput, 0)
+	pipelinesList := make([]*pipelineExtendedInfo, 0)
 
 	for _, pipeline := range pipelinesOutput.Pipelines {
 		fmt.Printf("pipeline %s %s\n", *pipeline.Name, *pipeline.Updated)
@@ -101,10 +208,20 @@ func (stage *PipeStage) getPipelines() ([]*codepipeline.GetPipelineStateOutput, 
 			Name: pipeline.Name,
 		})
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to get pipeline state %s, %v\n", *pipeline.Name, err)
+			continue
+		}
+		pipelineInfo, err := client.GetPipeline(&codepipeline.GetPipelineInput{
+			Name: pipeline.Name,
+		})
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to get pipeline %s, %v\n", *pipeline.Name, err)
 			continue
 		}
-		pipelinesList = append(pipelinesList, pipelineState)
+		pipelinesList = append(pipelinesList, &pipelineExtendedInfo{
+			state: pipelineState,
+			info:  pipelineInfo,
+		})
 	}
 	return pipelinesList, nil
 }
@@ -116,6 +233,8 @@ type actionObject struct {
 	LastUpdate string
 	Author     string
 	URL        string
+	ID         string
+	ChangeID   string
 	Time       *time.Time
 }
 
@@ -144,25 +263,38 @@ func (stage *PipeStage) getPipelinesOutput() (pipelinesOutput, error) {
 	var pipes []pipelineObject
 	for _, pipe := range pipelines {
 		var actions []actionObject
-		for _, stage := range pipe.StageStates {
+		for _, stage := range pipe.state.StageStates {
 			for _, action := range stage.ActionStates {
 				a := actionObject{}
 				if action.LatestExecution != nil {
 					a.Status = *action.LatestExecution.Status
 					a.Summary = derefString(action.LatestExecution.Summary)
 					a.Author = derefString(action.LatestExecution.LastUpdatedBy)
-					a.URL = derefString(action.LatestExecution.ExternalExecutionUrl)
+					// a.URL = derefString(action.LatestExecution.ExternalExecutionUrl)
 					a.Name = derefString(action.ActionName)
+					a.ID = derefString(action.LatestExecution.ExternalExecutionId)
 					if action.CurrentRevision != nil {
 						a.Time = action.CurrentRevision.Created
+						a.ChangeID = derefString(action.RevisionUrl)
 					}
 				}
 
 				actions = append(actions, a)
 			}
 		}
+		idx := 0
+		for _, s := range pipe.info.Pipeline.Stages {
+			for _, action := range s.Actions {
+				q := url.Values{}
+				q.Set("provider", *action.ActionTypeId.Provider)
+				q.Set("id", actions[idx].ID)
+				q.Set("account", fmt.Sprintf("%d", stage.ID))
+				actions[idx].URL = fmt.Sprintf("./details?%s", q.Encode())
+				idx = idx + 1
+			}
+		}
 		pipes = append(pipes, pipelineObject{
-			Name:    *pipe.PipelineName,
+			Name:    *pipe.state.PipelineName,
 			Actions: actions,
 		})
 	}
@@ -173,9 +305,9 @@ func (stage *PipeStage) getPipelinesOutput() (pipelinesOutput, error) {
 }
 
 // SetupStage sets up a PipeStage with configuration struct
-func SetupStage(configuration stageConfiguration) PipeStage {
+func SetupStage(id int, configuration stageConfiguration) PipeStage {
 	stage := PipeStage{}
-	stage.setupClient(configuration)
+	stage.setupClient(id, configuration)
 	return stage
 }
 
@@ -191,8 +323,8 @@ func parseConfig(configFile string) ([]PipeStage, error) {
 	}
 	var pipeStages []PipeStage
 
-	for _, config := range configs {
-		pipeStages = append(pipeStages, SetupStage(config))
+	for idx, config := range configs {
+		pipeStages = append(pipeStages, SetupStage(idx, config))
 	}
 
 	return pipeStages, nil

@@ -23,7 +23,7 @@
         " href="{{if .URL}}{{.URL}}{{end}}" data-toggle="tooltip" title="{{.Status}}" data-content="
         {{- .Author }}
         {{- .Summary }}
-        ">
+        " style="display: flex; align-items: center; justify-content: space-between;">
 
         {{ if .Time }}
           {{Time .Time}}
@@ -38,7 +38,6 @@
         {{ else if eq "InProgress" .Status }}
           <i class="fa fa-refresh fa-spin"></i>
         {{ end }}
-
       </a>
     </div>
     {{ end }}
